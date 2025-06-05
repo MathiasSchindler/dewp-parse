@@ -944,6 +944,122 @@ static const isbn_pattern_t isbn_patterns[] = {
 
 static inline int is_valid_isbn_char_fast(char c);
 
+/*
+ * focused_isbn_extraction_callback - Dedicated callback for optimized ISBN extraction.
+ * This function is invoked by parse_wiki_xml_mt when the 'extract-isbns' action is selected.
+ * It contains refined logic for finding and validating ISBNs efficiently.
+ */
+void focused_isbn_extraction_callback(const char* title, size_t title_len,
+                                   const char* text, size_t text_len,
+                                   void* user_data) {
+    isbn_context_t* ctx = (isbn_context_t*)user_data;
+
+    // Thread-local write buffer
+    static __thread write_buffer_t* local_write_buffer = NULL;
+    if (!local_write_buffer) {
+        local_write_buffer =
+            create_write_buffer(ctx->output_file, &ctx->mutex, WRITE_BUFFER_SIZE);
+        if (local_write_buffer)
+            register_cleanup(flush_and_free_write_buffer, local_write_buffer);
+    }
+
+    // Note: Title is directly available from the arguments (title, title_len)
+    // No need to call extract_title_and_text again if it's already provided
+    // by the main parsing loop.
+
+    const char* text_end = text + text_len;
+    const char* current_search_pos = text;
+
+    // Optimized search: Find the earliest occurrence of any ISBN pattern in a single pass
+    // over the text for each found ISBN.
+    while (current_search_pos < text_end) {
+        const char* earliest_match_overall = NULL;
+        const isbn_pattern_t* matched_pattern_info = NULL;
+
+        // Iterate through all defined ISBN patterns
+        for (const isbn_pattern_t* pattern = isbn_patterns; pattern->prefix; pattern++) {
+            if (current_search_pos >= text_end) break; // Optimization: if we are at or past the end
+
+            size_t remaining_text_len = text_end - current_search_pos;
+            // Ensure remaining_text_len is not smaller than pattern->prefix_len before search
+            if (remaining_text_len < pattern->prefix_len) {
+                continue;
+            }
+            const char* current_pattern_match = fast_strstr(current_search_pos, pattern->prefix, remaining_text_len, pattern->prefix_len);
+
+            if (current_pattern_match) {
+                if (!earliest_match_overall || current_pattern_match < earliest_match_overall) {
+                    earliest_match_overall = current_pattern_match;
+                    matched_pattern_info = pattern;
+                }
+            }
+        }
+
+        if (!earliest_match_overall) {
+            break; // No more ISBN patterns found in the rest of the text
+        }
+
+        // At this point, earliest_match_overall points to the start of the found pattern prefix
+        // and matched_pattern_info has the details of which pattern was found.
+        // Proceed to extract the ISBN value itself, validate it, and record it.
+        const char* isbn_start = earliest_match_overall + matched_pattern_info->prefix_len;
+
+        // Skip whitespace (same as before)
+        while (isbn_start < text_end && (*isbn_start == ' ' || *isbn_start == ':' || *isbn_start == '=')) {
+            isbn_start++;
+        }
+
+        const char* isbn_end = isbn_start;
+        // Find end based on pattern type (same as before)
+        if (matched_pattern_info == &isbn_patterns[6] || matched_pattern_info == &isbn_patterns[7]) { // Template patterns like {{ISBN|...}}
+            while (isbn_end < text_end && *isbn_end != '|' && *isbn_end != '}') {
+                isbn_end++;
+            }
+        } else { // Regular ISBN patterns
+            isbn_end = isbn_start; // Start scan from the beginning of potential ISBN data
+            while (isbn_end < text_end && (is_valid_isbn_char_fast(*isbn_end) || *isbn_end == ' ')) {
+                isbn_end++;
+            }
+            // Trim trailing spaces and hyphens (same as before)
+            while (isbn_end > isbn_start && (*(isbn_end-1) == ' ' || *(isbn_end-1) == '-')) {
+                isbn_end--;
+            }
+        }
+
+        if (isbn_start < isbn_end) { // Ensure there's a non-empty potential ISBN string
+            int checksum_valid = 1; // Assume valid unless check fails
+            if (validate_isbn_fast(isbn_start, isbn_end, &checksum_valid)) {
+                char entry[512];
+                int len;
+
+                if (!checksum_valid) {
+                    len = snprintf(entry, sizeof(entry), "%.*s|%.*s|CHECKSUM_WRONG\n",
+                                  (int)title_len, title, (int)(isbn_end - isbn_start), isbn_start);
+                } else {
+                    len = snprintf(entry, sizeof(entry), "%.*s|%.*s\n",
+                                  (int)title_len, title, (int)(isbn_end - isbn_start), isbn_start);
+                }
+
+                if (len > 0 && len < sizeof(entry)) {
+                    buffered_write(local_write_buffer, entry, len);
+
+                    pthread_mutex_lock(&ctx->mutex);
+                    ctx->found_isbns++;
+                    if (ctx->found_isbns % 10000 == 0) {
+                        printf("Found %d ISBNs so far\n", ctx->found_isbns);
+                    }
+                    pthread_mutex_unlock(&ctx->mutex);
+                }
+            }
+        }
+
+        // Advance current_search_pos for the next iteration.
+        // Important: Advance beyond the *start* of the found pattern prefix.
+        current_search_pos = earliest_match_overall + 1;
+    }
+}
+
+
 void extract_isbns_callback(const char* title, size_t title_len, 
                            const char* text, size_t text_len, 
                            void* user_data) {
@@ -1081,8 +1197,23 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
+    // Argument parsing needs to be aware of the action
+    int opt_idx = 3; // Starting index for options, assuming argv[0]=program, argv[1]=file, argv[2]=action
+
+    if (strcmp(action, "extract-isbns") == 0) {
+        // For extract-isbns, argv[3] could be an output file or an option
+        if (argc > 3 && argv[3][0] != '-' && !isdigit(argv[3][0])) {
+            // This looks like an output file path
+            opt_idx = 4; // Options start after the output file path
+        }
+    } else if (strcmp(action, "search") == 0) {
+        // For search, argv[3] is search_term, argv[4] is context_size
+        opt_idx = 5; // Options start after search term and context size
+    }
+    // For count-cats, options start at argv[3]
+
     // Parse additional options
-    for (int i = 3; i < argc; i++) {
+    for (int i = opt_idx; i < argc; i++) {
         if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             config->num_threads = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--no-simd") == 0) {
@@ -1090,6 +1221,7 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--no-prefetch") == 0) {
             config->enable_prefetch = false;
         }
+        // Add other general options here if needed
     }
     
     if (strcmp(action, "count-cats") == 0) {
@@ -1151,17 +1283,25 @@ int main(int argc, char* argv[]) {
         printf("Search results saved to %s\n", output_filename);
     }
     else if (strcmp(action, "extract-isbns") == 0) {
+        // For detailed performance analysis of ISBN extraction, consider using profiling tools
+        // like 'perf' on Linux. For example:
+        // perf record -g ./wiki_parser <path_to_xml_dump> extract-isbns
+        // perf report
+        // This can help identify specific hotspots in the code.
         printf("Extracting ISBNs from all articles...\n");
         
         char output_filename[256];
-        snprintf(output_filename, sizeof(output_filename), "isbns.txt");
+        snprintf(output_filename, sizeof(output_filename), "isbns.txt"); // Default output filename
         
-        // Check if next argument is output filename or thread count
-        if (argc >= 4 && !isdigit(argv[3][0]) && argv[3][0] != '-') {
+        // Simplified argument parsing for extract-isbns
+        // Primary arguments: input file (argv[1]), optional output file (argv[3] if not an option)
+        if (argc > 3 && argv[3][0] != '-' && !isdigit(argv[3][0])) { // Check if argv[3] is likely a filename
             strncpy(output_filename, argv[3], sizeof(output_filename) - 1);
             output_filename[sizeof(output_filename) - 1] = '\0';
+            // Options will be parsed from argv[4] onwards by the generic option parser
         }
-        
+        // Else, options are parsed from argv[3] onwards
+
         FILE* output_file = fopen(output_filename, "w");
         if (!output_file) {
             perror("Failed to create output file");
@@ -1180,10 +1320,24 @@ int main(int argc, char* argv[]) {
         pthread_mutex_init(&ctx.mutex, NULL);
         
         printf("Extracting ISBNs to %s...\n", output_filename);
-        parse_wiki_xml_mt(filename, extract_isbns_callback, &ctx, config);
         
-        time_t end_time = time(NULL);
-        double elapsed = difftime(end_time, ctx.start_time);
+        // Add timing for parse_wiki_xml_mt
+        clock_t parsing_start_time = clock();
+        time_t wall_parsing_start_time = time(NULL);
+
+        // Use the new callback function for ISBN extraction
+        parse_wiki_xml_mt(filename, focused_isbn_extraction_callback, &ctx, config);
+
+        clock_t parsing_end_time = clock();
+        time_t wall_parsing_end_time = time(NULL);
+        double parsing_cpu_time_used = ((double) (parsing_end_time - parsing_start_time)) / CLOCKS_PER_SEC;
+        double parsing_wall_time_used = difftime(wall_parsing_end_time, wall_parsing_start_time);
+
+        printf("Core parsing and ISBN extraction phase completed in %.2f seconds (CPU time) / %.2f seconds (wall clock time).\n",
+               parsing_cpu_time_used, parsing_wall_time_used);
+
+        time_t end_time = time(NULL); // This is overall end time for the action
+        double elapsed = difftime(end_time, ctx.start_time); // Overall wall time for the action
         double rate = elapsed > 0 ? ctx.found_isbns / elapsed : 0;
         
         printf("ISBN extraction complete. Found %d ISBNs in %.1f seconds (%.1f ISBNs/sec).\n", 
