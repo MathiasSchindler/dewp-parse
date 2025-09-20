@@ -12,6 +12,9 @@ A high-performance C program for parsing large Wikipedia XML dumps using memory 
 - Provides a flexible callback interface for processing articles
 - Includes progress reporting and performance statistics
 
+> **Note**: This project was developed entirely by Claude Opus 4 in VS Code, exploring AI-assisted development capabilities.
+
+
 ## Building the Parser
 
 ```bash
